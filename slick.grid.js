@@ -9,7 +9,7 @@
  * (c) 2009-2010 Michael Leibman (michael.leibman@gmail.com)
  * All rights reserved.
  *
- * SlickGrid v1.3.1
+ * SlickGrid v1.3.2
  *
  * TODO:
  * - frozen columns
@@ -36,6 +36,7 @@
  *     showSecondaryHeaderRow   - (default false) If true, an extra blank (to be populated externally) row will be displayed just below the header columns.
  *     secondaryHeaderRowHeight - (default 25px) The height of the secondary header row.
  *     syncColumnCellResize     - (default false) Synchronously resize column cells when column headers are resized
+ *     rowCssClasses            - (default null) A function which (given a row's data item as an argument) returns a space-delimited string of CSS classes that will be applied to the slick-row element. Note that this should be fast, as it is called every time a row is displayed.
  *
  *
  * COLUMN DEFINITION (columns) OPTIONS:
@@ -104,7 +105,7 @@ if (!jQuery.fn.drag) {
     throw new Error("SlickGrid requires jquery.event.drag module to be loaded");
 }
 
-(function() {
+(function($) {
     var scrollbarDimensions; // shared across all grids on this page
 
 
@@ -328,6 +329,23 @@ if (!jQuery.fn.drag) {
             }
         }
 
+        // TODO: PERF: throttle event
+        function handleHover(e) {
+            if (!options.enableAutoTooltips) {
+                return;
+            }
+
+            var $cell = $(e.target).closest(".slick-cell",$canvas);
+            if ($cell && $cell.length) {
+                if ($cell.innerWidth() < $cell[0].scrollWidth) {
+                    $cell.attr("title", $.trim($cell.text()));
+                }
+                else {
+                    $cell.attr("title","");
+                }
+            }
+        }
+
         function defaultGetLength() {
             /// <summary>
             /// Default implementation of getLength method
@@ -400,7 +418,7 @@ if (!jQuery.fn.drag) {
 
             // with autoHeight, we can set the mainscroller's y-overflow to auto, since the scroll bar will not appear
             var msStyle = "width:100%;overflow-x:auto;outline:0;position:relative;overflow-y:" + (options.autoHeight ? "auto;" : "scroll;");
-            $viewport = $("<div tabIndex='0' hideFocus style='" + msStyle + "'>").appendTo($container);
+            $viewport = $("<div class='slick-viewport' tabIndex='0' hideFocus style='" + msStyle + "'>").appendTo($container);
             $canvas = $("<div class='grid-canvas' tabIndex='0' hideFocus style='overflow:hidden' />").appendTo($viewport);
 
             // header columns and cells may have different padding/border skewing width calculations (box-sizing, hello?)
@@ -423,14 +441,11 @@ if (!jQuery.fn.drag) {
             createColumnHeaders();
             setupRowReordering();
             createCssRules();
-            resizeCanvas();
-            if (options.forceFitColumns) {
-                autosizeColumns();
-            }
-            render();
+            
+			resizeAndRender();
 
             $viewport.bind("scroll", handleScroll);
-            $container.bind("resize", resizeCanvas);
+            $container.bind("resize", resizeAndRender);
             $canvas.bind("keydown", handleKeyDown);
             $canvas.bind("click", handleClick);
             $canvas.bind("dblclick", handleDblClick);
@@ -826,7 +841,7 @@ if (!jQuery.fn.drag) {
             options.editorLock.cancelCurrentEdit();
 
             if (self.onBeforeDestroy) { self.onBeforeDestroy(); }
-            $headers.sortable("destroy");
+            if ($headers.sortable) { $headers.sortable("destroy"); }
             $container.unbind("resize", resizeCanvas);
             removeCssRules();
 
@@ -1014,8 +1029,16 @@ if (!jQuery.fn.drag) {
         function appendRowHtml(stringArray,row) {
             var d = gridDataGetItem(row);
             var dataLoading = row < gridDataGetLength() && !d;
-            var css = "slick-row " + (dataLoading ? " loading" : "") + (selectedRowsLookup[row] ? " selected ui-state-active" : "");
+            var css = "slick-row " + 
+					(dataLoading ? " loading" : "") + 
+					(selectedRowsLookup[row] ? " selected ui-state-active" : "") +
+					(row % 2 == 1 ? ' odd' : ' even');
 
+			// if the user has specified a function to provide additional per-row css classes, call it here
+			if (options.rowCssClasses) {
+				css += ' ' + options.rowCssClasses(d);
+			}
+					 
             stringArray.push("<div class='ui-widget-content " + css + "' row='" + row + "' style='top:" + (options.rowHeight*row) + "px'>");
 
             for (var i=0, cols=columns.length; i<cols; i++) {
@@ -1156,6 +1179,14 @@ if (!jQuery.fn.drag) {
             render();
         }
 
+		function resizeAndRender() {
+	        if (options.forceFitColumns) {
+	            autosizeColumns();
+	        } else {
+				resizeCanvas();
+			}
+		}
+		
         function updateRowCount() {
             // remove the rows that are now outside of the data range
             // this helps avoid redundant calls to .removeRow() when the size of the data decreased by thousands of rows
@@ -1188,13 +1219,16 @@ if (!jQuery.fn.drag) {
                 rowsBefore = renderedRows,
                 stringArray = [],
                 rows =[],
-                startTimestamp = new Date();
+                startTimestamp = new Date(),
+                needToReselectCell = false;
 
             for (i = from; i <= to; i++) {
                 if (rowsCache[i]) { continue; }
                 renderedRows++;
                 rows.push(i);
                 appendRowHtml(stringArray,i);
+                if (currentCellNode && currentRow === i)
+                    needToReselectCell = true;
                 counter_rows_rendered++;
             }
 
@@ -1203,6 +1237,11 @@ if (!jQuery.fn.drag) {
 
             for (i = 0, l = x.childNodes.length; i < l; i++) {
                 rowsCache[rows[i]] = parentNode.appendChild(x.firstChild);
+            }
+
+            if (needToReselectCell) {
+                currentCellNode = $(rowsCache[currentRow]).find(".slick-cell[cell=" + currentCell + "]")[0];
+                setSelectedCell(currentCellNode,false);
             }
 
             if (renderedRows - rowsBefore > MIN_BUFFER) {
@@ -1243,6 +1282,13 @@ if (!jQuery.fn.drag) {
 
             lastRenderedScrollTop = currentScrollTop;
             h_render = null;
+        }
+
+        //--------------------------------------------------
+        function invalidate() {
+            updateRowCount(gridDataGetLength());
+            removeAllRows();
+            render();
         }
 
         function handleScroll() {
@@ -1358,8 +1404,11 @@ if (!jQuery.fn.drag) {
                                 gotoDir(1, 0, false);
                             }
                             else {
-                                options.editorLock.commitCurrentEdit();
-                                currentCellNode.focus();
+                                // if the commit fails, it would do so due to a validation error
+                                // if so, do not steal the focus from the editor
+                                if (options.editorLock.commitCurrentEdit()) {
+                                    currentCellNode.focus();
+                                }
                             }
                         } else {
                             if (options.editorLock.commitCurrentEdit()) {
@@ -1520,21 +1569,6 @@ if (!jQuery.fn.drag) {
             }
         }
 
-        // TODO: PERF: throttle event
-        function handleHover(e) {
-            if (!options.enableAutoTooltips) return;
-
-            var $cell = $(e.target).closest(".slick-cell",$canvas);
-            if ($cell && $cell.length) {
-                if ($cell.innerWidth() < $cell[0].scrollWidth) {
-                    $cell.attr("title", $.trim($cell.text()));
-                }
-                else {
-                    $cell.attr("title","");
-                }
-            }
-        }
-
         function getCellFromPoint(x,y) {
             var row = Math.floor(y/options.rowHeight);
             var cell = 0;
@@ -1688,6 +1722,10 @@ if (!jQuery.fn.drag) {
             currentEditor = new columns[currentCell].editor($(currentCellNode), columns[currentCell], value, gridDataGetItem(currentRow));
         }
 
+        function getCellEditor() {
+            return currentEditor;
+        }
+        
         function scrollSelectedCellIntoView() {
             if (!currentCellNode) { return; }
             var scrollTop = $viewport[0].scrollTop;
@@ -1882,7 +1920,7 @@ if (!jQuery.fn.drag) {
         // Public API
 
         $.extend(this, {
-            "slickGridVersion": "1.3.1",
+            "slickGridVersion": "1.3.2",
 
             // Events
             "onSort":                null,
@@ -1917,12 +1955,14 @@ if (!jQuery.fn.drag) {
             "removeRows":          removeRows,
             "removeAllRows":       removeAllRows,
             "render":              render,
+            "invalidate":          invalidate,
             "getViewport":         getViewport,
             "resizeCanvas":        resizeCanvas,
             "updateRowCount":      updateRowCount,
             "getCellFromPoint":    getCellFromPoint,
             "gotoCell":            gotoCell,
             "editCurrentCell":     makeSelectedCellEditable,
+            "getCellEditor":       getCellEditor,
             "getSelectedRows":     getSelectedRows,
             "setSelectedRows":     setSelectedRows,
             "getSecondaryHeaderRow":    getSecondaryHeaderRow,
@@ -1942,4 +1982,4 @@ if (!jQuery.fn.drag) {
             GlobalEditorLock: new EditorLock()
         }
     });
-}());
+}(jQuery));

@@ -9,7 +9,7 @@
  * (c) 2009-2010 Michael Leibman (michael.leibman@gmail.com)
  * All rights reserved.
  *
- * SlickGrid v1.3.2
+ * SlickGrid v1.4
  *
  * TODO:
  * - frozen columns
@@ -49,7 +49,6 @@
  *     validator           - An extra validation function to be passed to the editor.
  *     unselectable        - If true, the cell cannot be selected (and therefore edited).
  *     cannotTriggerInsert - If true, a new row cannot be created from just the value of this cell.
- *     setValueHandler     - If true, this handler will be called to set field value instead of context[field].
  *     width               - Width of the column in pixels.
  *     resizable           - (default true) If false, the column cannot be resized.
  *     sortable            - (default false) If true, the column can be sorted (onSort will be called).
@@ -235,17 +234,17 @@ if (!jQuery.fn.drag) {
             showSecondaryHeaderRow: false,
             secondaryHeaderRowHeight: 25,
             syncColumnCellResize: false,
-            enableAutoTooltips: true
+            enableAutoTooltips: true,
+            formatterFactory: null,
+            editorFactory: null,
+            cellHighlightCssClass: "highlighted"
         },
         gridData, gridDataGetLength, gridDataGetItem;
 
         var columnDefaults = {
             resizable: true,
             sortable: false,
-            minWidth: 30,
-            formatter: function defaultFormatter(row, cell, value, columnDef, dataContext) {
-                return (value === null || value === undefined) ? "" : value;
-            }
+            minWidth: 30
         };
 
         // consts
@@ -269,6 +268,7 @@ if (!jQuery.fn.drag) {
         var currentRow, currentCell;
         var currentCellNode = null;
         var currentEditor = null;
+        var serializedEditorValue;
         var editController;
 
         var rowsCache = {};
@@ -283,6 +283,7 @@ if (!jQuery.fn.drag) {
         var selectedRows = [];
         var selectedRowsLookup = {};
         var columnsById = {};
+        var highlightedCells;
 
         // async call handles
         var h_editorLoader = null;
@@ -429,6 +430,7 @@ if (!jQuery.fn.drag) {
 
             resizeAndRender();
 
+            bindAncestorScrollEvents();
             $viewport.bind("scroll", handleScroll);
             $container.bind("resize", resizeAndRender);
             $canvas.bind("keydown", handleKeyDown);
@@ -437,6 +439,20 @@ if (!jQuery.fn.drag) {
             $canvas.bind("contextmenu", handleContextMenu);
             $canvas.bind("mouseover", handleHover);
             $headerScroller.bind("contextmenu", handleHeaderContextMenu);
+        }
+
+        // TODO:  this is static.  need to handle page mutation.
+        function bindAncestorScrollEvents() {
+            var elem = $canvas[0];
+            while ((elem = elem.parentNode) != document.body) {
+                // bind to scroll containers only
+                if (elem == $viewport[0] || elem.scrollWidth != elem.clientWidth || elem.scrollHeight != elem.clientHeight)
+                    $(elem).bind("scroll.slickgrid", repositionCurrentCellEditor);
+            }
+        }
+
+        function unbindAncestorScrollEvents() {
+            $canvas.parents().unbind("scroll.slickgrid");
         }
 
         function createColumnHeaders() {
@@ -837,6 +853,7 @@ if (!jQuery.fn.drag) {
 
             if (self.onBeforeDestroy) { self.onBeforeDestroy(); }
             if ($headers.sortable) { $headers.sortable("destroy"); }
+            unbindAncestorScrollEvents();
             $container.unbind("resize", resizeCanvas);
             removeCssRules();
 
@@ -1046,9 +1063,24 @@ if (!jQuery.fn.drag) {
         //////////////////////////////////////////////////////////////////////////////////////////////
         // Rendering / Scrolling
 
+        function defaultFormatter(row, cell, value, columnDef, dataContext) {
+            return (value === null || value === undefined) ? "" : value;
+        }
+
+        function getFormatter(column) {
+            return column.formatter ||
+                    (options.formatterFactory && options.formatterFactory.getFormatter(column)) ||
+                    defaultFormatter;
+        }
+
+        function getEditor(column) {
+            return column.editor || (options.editorFactory && options.editorFactory.getEditor(column));
+        }
+
         function appendRowHtml(stringArray,row) {
             var d = gridDataGetItem(row);
             var dataLoading = row < gridDataGetLength() && !d;
+            var cellCss;
             var css = "slick-row " +
                 (dataLoading ? " loading" : "") +
                 (selectedRowsLookup[row] ? " selected ui-state-active" : "") +
@@ -1065,11 +1097,15 @@ if (!jQuery.fn.drag) {
                 var m = columns[i];
                 if (m.hidden) continue;
 
-                stringArray.push("<div " + (m.unselectable ? "tabIndex=-1 " : "hideFocus tabIndex=0 ") + "class='slick-cell c" + i + (m.cssClass ? " " + m.cssClass : "") + "' cell=" + i + ">");
+                cellCss = "slick-cell c" + i + (m.cssClass ? " " + m.cssClass : "");
+                if (highlightedCells && highlightedCells[row] && highlightedCells[row][m.id])
+                    cellCss += (" " + options.cellHighlightCssClass);
+
+                stringArray.push("<div " + (m.unselectable ? "tabIndex=-1 " : "hideFocus tabIndex=0 ") + "class='" + cellCss + "' cell=" + i + ">");
 
                 // if there is a corresponding row (if not, this is the Add New row or this data hasn't been loaded yet)
                 if (d && row < gridDataGetLength()) {
-                    stringArray.push(m.formatter(row, i, d[m.field], m, d));
+                    stringArray.push(getFormatter(m)(row, i, d[m.field], m, d));
                 }
 
                 stringArray.push("</div>");
@@ -1087,6 +1123,9 @@ if (!jQuery.fn.drag) {
         }
 
         function removeAllRows() {
+            if (currentEditor) {
+                makeSelectedCellNormal();
+            }
             $canvas[0].innerHTML = "";
             rowsCache= {};
             postProcessedRows = {};
@@ -1111,7 +1150,7 @@ if (!jQuery.fn.drag) {
             var nodes = [];
             for (i=0, rl=rows.length; i<rl; i++) {
                 if (currentEditor && currentRow === i) {
-                    throw "Grid : removeRow : Cannot remove a row that is currently in edit mode";
+                    makeSelectedCellNormal();
                 }
 
                 if (rowsCache[rows[i]]) {
@@ -1140,10 +1179,10 @@ if (!jQuery.fn.drag) {
 
             var m = columns[cell], d = gridDataGetItem(row);
             if (currentEditor && currentRow === row && currentCell === cell) {
-                currentEditor.setValue(d[m.field]);
+                currentEditor.loadValue(d);
             }
             else {
-                $cell[0].innerHTML = d ? m.formatter(row, cell, d[m.field], m, d) : "";
+                $cell[0].innerHTML = d ? getFormatter(m)(row, cell, d[m.field], m, d) : "";
                 invalidatePostProcessingResults(row);
             }
         }
@@ -1155,10 +1194,10 @@ if (!jQuery.fn.drag) {
             $(rowsCache[row]).find(".slick-cell").each(function(i) {
                 var m = columns[i];
                 if (row === currentRow && i === currentCell && currentEditor) {
-                    currentEditor.setValue(gridDataGetItem(currentRow)[m.field]);
+                    currentEditor.loadValue(gridDataGetItem(currentRow));
                 }
                 else if (gridDataGetItem(row)) {
-                    this.innerHTML = m.formatter(row, i, gridDataGetItem(row)[m.field], m, gridDataGetItem(row));
+                    this.innerHTML = getFormatter(m)(row, i, gridDataGetItem(row)[m.field], m, gridDataGetItem(row));
                 }
                 else {
                     this.innerHTML = "";
@@ -1374,6 +1413,33 @@ if (!jQuery.fn.drag) {
             }
         }
 
+        function setHighlightedCells(cellsToHighlight) {
+            var i, $cell, hasHighlight, hadHighlight;
+
+            // TODO: move this upstream and reuse
+            var idx = 0, nodeIndices = [];
+            for (i=0; i<columns.length; i++) {
+                if (!columns[i].hidden) {
+                    nodeIndices[i] = idx++;
+                }
+            }
+
+            for (var row in rowsCache) {
+                for (i=0; i<columns.length; i++) {
+                    hadHighlight = highlightedCells && highlightedCells[row] && highlightedCells[row][columns[i].id];
+                    hasHighlight = cellsToHighlight && cellsToHighlight[row] && cellsToHighlight[row][columns[i].id];
+
+                    if (hadHighlight != hasHighlight) {
+                        $cell = $(rowsCache[row]).children().eq(nodeIndices[i]);
+                        if ($cell.length) {
+                            $cell.toggleClass(options.cellHighlightCssClass);
+                        }
+                    }
+                }
+            }
+
+            highlightedCells = cellsToHighlight;
+        }
 
         //////////////////////////////////////////////////////////////////////////////////////////////
         // Interactivity
@@ -1391,55 +1457,47 @@ if (!jQuery.fn.drag) {
                     if (!options.editorLock.isActive()) {
                         return; // no editing mode to cancel, allow bubbling and default processing (exit without cancelling the event)
                     }
-                    options.editorLock.cancelCurrentEdit();
-                    if (currentCellNode) {
-                        currentCellNode.focus();
-                    }
+                    cancelEditAndSetFocus();
                     break;
 
                 case 9:  // tab
-                    gotoDir(0, (e.shiftKey) ? -1 : 1, true);
+                    if (e.shiftKey)
+                        navigatePrev();
+                    else
+                        navigateNext();
                     break;
 
                 case 37:  // left
-                    gotoDir(0, -1, false);
+                    navigateLeft();
                     break;
 
                 case 39:  // right
-                    gotoDir(0, 1, false);
+                    navigateRight();
                     break;
 
                 case 38:  // up
-                    gotoDir(-1, 0, false);
+                    navigateUp();
                     break;
 
                 case 40:  // down
-                    gotoDir(1, 0, false);
+                    navigateDown();
                     break;
 
                 case 13:  // enter
-                    if (options.autoEdit) {
-                        gotoDir(1, 0, false);
-                    }
-                    else if (options.editable) {
+                    if (options.editable) {
                         if (currentEditor) {
                             // adding new row
                             if (currentRow === data.length) {
-                                gotoDir(1, 0, false);
+                                navigateDown();
                             }
                             else {
-                                // if the commit fails, it would do so due to a validation error
-                                // if so, do not steal the focus from the editor
-                                if (options.editorLock.commitCurrentEdit()) {
-                                    currentCellNode.focus();
-                                }
+                                commitEditAndSetFocus();
                             }
                         } else {
                             if (options.editorLock.commitCurrentEdit()) {
                                 makeSelectedCellEditable();
                             }
                         }
-
                     }
                     break;
 
@@ -1593,7 +1651,6 @@ if (!jQuery.fn.drag) {
             }
         }
 
-        // TODO: PERF: throttle event
         function handleHover(e) {
             if (!options.enableAutoTooltips) return;
             var $cell = $(e.target).closest(".slick-cell",$canvas);
@@ -1623,10 +1680,29 @@ if (!jQuery.fn.drag) {
 
         //////////////////////////////////////////////////////////////////////////////////////////////
         // Cell switching
+        
         function resetCurrentCell() {
             setSelectedCell(null,false,false);
         }
 
+        function focusOnCurrentCell() {
+            if ($.browser.msie && parseInt($.browser.version) < 8) {
+                // IE7 tries to scroll the viewport so that the item being focused is aligned to the left border
+                // IE-specific .setActive() sets the focus, but doesn't scroll
+                currentCellNode.setActive();
+                var left = $(currentCellNode).position().left,
+                    right = left + $(currentCellNode).outerWidth(),
+                    scrollLeft = $viewport.scrollLeft(),
+                    scrollRight = scrollLeft + $viewport.width();
+                if (left < scrollLeft)
+                    $viewport.scrollLeft(left);
+                else if (right > scrollRight)
+                    $viewport.scrollLeft(Math.min(left,right - $viewport[0].clientWidth));
+            }
+            else
+                currentCellNode.focus();
+        }
+        
         function setSelectedCell(newCell,editMode,doPaging) {
             if (currentCellNode !== null) {
                 makeSelectedCellNormal();
@@ -1654,7 +1730,7 @@ if (!jQuery.fn.drag) {
                     }
                 }
                 else {
-                    currentCellNode.focus();
+                    focusOnCurrentCell()
                 }
             }
             else {
@@ -1702,7 +1778,7 @@ if (!jQuery.fn.drag) {
             }
 
             // does this cell have an editor?
-            if (!columns[cell].editor) {
+            if (!getEditor(columns[cell])) {
                 return false;
             }
 
@@ -1716,14 +1792,17 @@ if (!jQuery.fn.drag) {
                 self.onBeforeCellEditorDestroy(currentEditor);
             }
             currentEditor.destroy();
-            $(currentCellNode).removeClass("editable invalid");
-
-            if (gridDataGetItem(currentRow)) {
-                currentCellNode.innerHTML = columns[currentCell].formatter(currentRow, currentCell, gridDataGetItem(currentRow)[columns[currentCell].field], columns[currentCell], gridDataGetItem(currentRow));
-                invalidatePostProcessingResults(currentRow);
-            }
-
             currentEditor = null;
+
+            if (currentCellNode) {
+                $(currentCellNode).removeClass("editable invalid");
+
+                if (gridDataGetItem(currentRow)) {
+                    var column = columns[currentCell];
+                    currentCellNode.innerHTML = getFormatter(column)(currentRow, currentCell, gridDataGetItem(currentRow)[column.field], column, gridDataGetItem(currentRow));
+                    invalidatePostProcessingResults(currentRow);
+                }
+            }
 
             // if there previously was text selected on a page (such as selected text in the edit cell just removed),
             // IE can't set focus to anything else correctly
@@ -1745,32 +1824,97 @@ if (!jQuery.fn.drag) {
                 return;
             }
 
-
-
             if (self.onBeforeEditCell && self.onBeforeEditCell(currentRow,currentCell,gridDataGetItem(currentRow)) === false) {
-                currentCellNode.focus();
+                focusOnCurrentCell();
                 return;
             }
 
             options.editorLock.activate(editController);
             $(currentCellNode).addClass("editable");
 
-            var value = null;
-
-            // if there is a corresponding row
-            if (gridDataGetItem(currentRow)) {
-                value = gridDataGetItem(currentRow)[columns[currentCell].field];
-            }
-
             currentCellNode.innerHTML = "";
 
-            currentEditor = new columns[currentCell].editor($(currentCellNode), columns[currentCell], value, gridDataGetItem(currentRow), function() {
-                // if the commit fails, it would do so due to a validation error
-                // if so, do not steal the focus from the editor
-                if (options.editorLock.commitCurrentEdit()) {
-                    currentCellNode.focus();
-                }
+            var columnDef = columns[currentCell];
+            var item = gridDataGetItem(currentRow);
+
+            currentEditor = new (getEditor(columnDef))({
+                grid: self,
+                gridPosition: absBox($container[0]),
+                position: absBox(currentCellNode),
+                container: currentCellNode,
+                column: columnDef,
+                item: item || {},
+                commitChanges: commitEditAndSetFocus,
+                cancelChanges: cancelEditAndSetFocus
             });
+
+            if (item)
+                currentEditor.loadValue(item);
+
+            serializedEditorValue = currentEditor.serializeValue();
+            
+            if (currentEditor.position)
+                repositionCurrentCellEditor();
+        }
+
+        function commitEditAndSetFocus() {
+            // if the commit fails, it would do so due to a validation error
+            // if so, do not steal the focus from the editor
+            if (options.editorLock.commitCurrentEdit()) {
+                currentCellNode.focus();
+
+                if (options.autoEdit) {
+                    navigateDown();
+                }
+            }
+        }
+
+        function cancelEditAndSetFocus() {
+            if (options.editorLock.cancelCurrentEdit()) {
+                focusOnCurrentCell();
+            }
+        }
+
+        function absBox(elem) {
+            var box = {top:elem.offsetTop, left:elem.offsetLeft, bottom:0, right:0, width:$(elem).outerWidth(), height:$(elem).outerHeight(), visible:true};
+            box.bottom = box.top + box.height;
+            box.right = box.left + box.width;
+
+            // walk up the tree
+            var offsetParent = elem.offsetParent;
+            while ((elem = elem.parentNode) != document.body) {
+                if (box.visible && elem.scrollHeight != elem.offsetHeight && $(elem).css("overflowY") != "visible")
+                    box.visible = box.bottom > elem.scrollTop && box.top < elem.scrollTop + elem.clientHeight;
+
+                if (box.visible && elem.scrollWidth != elem.offsetWidth && $(elem).css("overflowX") != "visible")
+                    box.visible = box.right > elem.scrollLeft && box.left < elem.scrollLeft + elem.clientWidth;
+
+                box.left -= elem.scrollLeft;
+                box.top -= elem.scrollTop;
+
+                if (elem === offsetParent) {
+                    box.left += elem.offsetLeft;
+                    box.top += elem.offsetTop;
+                    offsetParent = elem.offsetParent;
+                }
+
+                box.bottom = box.top + box.height;
+                box.right = box.left + box.width;
+            }
+
+            return box;
+        }
+
+        function repositionCurrentCellEditor() {
+            if (!currentEditor || !currentCellNode || !currentEditor.position) return;
+            var cellBox = absBox(currentCellNode);
+            if (currentEditor.show && currentEditor.hide) {
+                if (!cellBox.visible)
+                    currentEditor.hide();
+                else
+                    currentEditor.show();
+            }
+            currentEditor.position(cellBox);
         }
 
         function getCellEditor() {
@@ -1846,11 +1990,11 @@ if (!jQuery.fn.drag) {
 
                 // if no editor was created, set the focus back on the cell
                 if (!currentEditor) {
-                    currentCellNode.focus();
+                    focusOnCurrentCell();
                 }
             }
             else {
-                currentCellNode.focus();
+                focusOnCurrentCell();
             }
         }
 
@@ -1871,50 +2015,94 @@ if (!jQuery.fn.drag) {
 
             // if no editor was created, set the focus back on the cell
             if (!currentEditor) {
-                currentCellNode.focus();
+                focusOnCurrentCell();
             }
         }
 
+        function navigateUp() {
+            gotoDir(-1, 0, false);
+        }
+
+        function navigateDown() {
+            gotoDir(1, 0, false);
+        }
+
+        function navigateLeft() {
+            gotoDir(0, -1, false);
+        }
+
+        function navigateRight() {
+            gotoDir(0, 1, false);
+        }
+
+        function navigatePrev() {
+            gotoDir(0, -1, true);
+        }
+
+        function navigateNext() {
+            gotoDir(0, 1, true);
+        }
 
         //////////////////////////////////////////////////////////////////////////////////////////////
         // IEditor implementation for the editor lock
 
         function commitCurrentEdit() {
+            var item = gridDataGetItem(currentRow);
+            var column = columns[currentCell];
+            
             if (currentEditor) {
                 if (currentEditor.isValueChanged()) {
                     var validationResults = currentEditor.validate();
 
                     if (validationResults.valid) {
-                        var value = currentEditor.getValue();
-
                         if (currentRow < gridDataGetLength()) {
-                            if (columns[currentCell].setValueHandler) {
+                            var editCommand = {
+                                row: currentRow,
+                                cell: currentCell,
+                                editor: currentEditor,
+                                serializedValue: currentEditor.serializeValue(),
+                                prevSerializedValue: serializedEditorValue,
+                                execute: function() {
+                                    this.editor.applyValue(item,this.serializedValue);
+                                    updateRow(this.row);
+                                },
+                                undo: function() {
+                                    this.editor.applyValue(item,this.prevSerializedValue);
+                                    updateRow(this.row);
+                                }
+                            };
+                            
+                            if (options.editCommandHandler) {
                                 makeSelectedCellNormal();
-                                columns[currentCell].setValueHandler(value, columns[currentCell], gridDataGetItem(currentRow));
+                                options.editCommandHandler(item,column,editCommand);
+
                             }
                             else {
-                                gridDataGetItem(currentRow)[columns[currentCell].field] = value;
+                                editCommand.execute();
                                 makeSelectedCellNormal();
                             }
 
                             if (self.onCellChange) {
-                                self.onCellChange(currentRow,currentCell,gridDataGetItem(currentRow));
+                                self.onCellChange(currentRow,currentCell,item);
                             }
                         }
                         else if (self.onAddNewRow) {
+                            var newItem = {};
+                            currentEditor.applyValue(newItem,currentEditor.serializeValue());
                             makeSelectedCellNormal();
-                            self.onAddNewRow(columns[currentCell], value);
+                            self.onAddNewRow(newItem,column);
                         }
 
                         // check whether the lock has been re-acquired by event handlers
                         return !options.editorLock.isActive();
                     }
                     else {
+                        // TODO: remove and put in onValidationError handlers in examples
                         $(currentCellNode).addClass("invalid");
                         $(currentCellNode).stop(true,true).effect("highlight", {color:"red"}, 300);
 
                         if (self.onValidationError) {
-                            self.onValidationError(currentCellNode, validationResults, currentRow, currentCell, columns[currentCell]);
+                            self.onValidationError(currentCellNode, validationResults, currentRow, currentCell, column);
                         }
 
                         currentEditor.focus();
@@ -1994,7 +2182,7 @@ if (!jQuery.fn.drag) {
         // Public API
 
         $.extend(this, {
-            "slickGridVersion": "1.3.2",
+            "slickGridVersion": "1.4",
 
             // Events
             "onSort":                null,
@@ -2031,6 +2219,7 @@ if (!jQuery.fn.drag) {
             "removeAllRows":       removeAllRows,
             "render":              render,
             "invalidate":          invalidate,
+            "setHighlightedCells": setHighlightedCells,
             "getViewport":         getViewport,
             "resizeCanvas":        resizeCanvas,
             "updateRowCount":      updateRowCount,
@@ -2038,6 +2227,12 @@ if (!jQuery.fn.drag) {
             "getCurrentCell":      getCurrentCell,
             "getCurrentCellNode":  getCurrentCellNode,
             "resetCurrentCell":    resetCurrentCell,
+            "navigatePrev":        navigatePrev,
+            "navigateNext":        navigateNext,
+            "navigateUp":          navigateUp,
+            "navigateDown":        navigateDown,
+            "navigateLeft":        navigateLeft,
+            "navigateRight":       navigateRight,
             "gotoCell":            gotoCell,
             "editCurrentCell":     makeSelectedCellEditable,
             "getCellEditor":       getCellEditor,
